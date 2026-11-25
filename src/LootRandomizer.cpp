@@ -5,9 +5,11 @@
 
 #include "Config.h"
 #include "Creature.h"
+#include "Group.h"
 #include "ItemTemplate.h"
 #include "Log.h"
 #include "LootMgr.h"
+#include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Player.h"
 #include "Random.h"
@@ -632,6 +634,40 @@ namespace
             }
         }
 
+        // The core populates LootItem::allowedGUIDs inside Loot::FillLoot(), which has already
+        // finished by the time this module injects items. Replicate that post-processing here so
+        // Player::StoreNewItem() can set ITEM_FIELD_FLAG_BOP_TRADEABLE for these items.
+        void PopulateInjectedLootAccess(Creature* killed, size_t firstIndex) const
+        {
+            if (firstIndex >= killed->loot.items.size())
+                return;
+
+            Player* lootOwner = ObjectAccessor::FindPlayer(killed->loot.lootOwnerGUID);
+            if (!lootOwner)
+                return;
+
+            Group* group = lootOwner->GetGroup();
+            if (!group)
+                return;
+
+            for (size_t i = firstIndex; i < killed->loot.items.size(); ++i)
+            {
+                LootItem& item = killed->loot.items[i];
+
+                if (ItemTemplate const* proto = sObjectMgr->GetItemTemplate(item.itemid))
+                    if (proto->Quality < uint32(group->GetLootThreshold()))
+                        item.is_underthreshold = true;
+
+                for (GroupReference* itr = group->GetFirstMember(); itr != nullptr; itr = itr->next())
+                {
+                    Player* member = itr->GetSource();
+                    if (member && member->IsAtLootRewardDistance(killed) &&
+                        item.AllowedForPlayer(member, killed->loot.sourceWorldObjectGUID))
+                        item.AddAllowedLooter(member);
+                }
+            }
+        }
+
         bool AddRandomLootItems(Creature* killed, std::vector<uint32> const& itemIds, uint32 requestedCount) const
         {
             if (itemIds.empty() || requestedCount == 0 || killed->loot.items.size() >= MAX_NR_LOOT_ITEMS)
@@ -651,7 +687,9 @@ namespace
                 std::swap(indices[i], indices[randomPos]);
 
                 LootStoreItem randomLoot(itemIds[indices[i]], 0, 100.0f, false, LOOT_MODE_DEFAULT, 0, 1, 1);
+                size_t firstIndex = killed->loot.items.size();
                 killed->loot.AddItem(randomLoot);
+                PopulateInjectedLootAccess(killed, firstIndex);
             }
 
             return countToAdd > 0;
