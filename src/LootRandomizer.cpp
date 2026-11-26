@@ -3,6 +3,8 @@
  * Adds configurable random loot drops to killed creatures.
  */
 
+#include "Chat.h"
+#include "CommandScript.h"
 #include "Config.h"
 #include "Creature.h"
 #include "Group.h"
@@ -20,6 +22,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -28,6 +31,8 @@
 #include <sstream>
 #include <string>
 #include <vector>
+
+using namespace Acore::ChatCommands;
 
 namespace
 {
@@ -144,11 +149,24 @@ namespace
     class RandomLootState
     {
     public:
+        enum class LootCategory : uint8 { Normal, Pet, Mount };
+
+        struct LootStats
+        {
+            uint64 rolls{0};
+            uint64 hits{0};
+            uint64 items{0};
+        };
+
         void LoadConfig()
         {
             std::unique_lock lock(_mutex);
 
             _enabled = sConfigMgr->GetOption<bool>("RandomLoot.Enable", false);
+
+            int32 debug = sConfigMgr->GetOption<int32>("RandomLoot.DebugLog", 0, false);
+            _debugLog = std::clamp(debug, 0, 2);
+            _announce = sConfigMgr->GetOption<bool>("RandomLoot.Announce", false, false);
 
             _minItems = std::max<int32>(0, sConfigMgr->GetOption<int32>("RandomLoot.MinItems", 1));
             _maxItems = std::max<int32>(_minItems, sConfigMgr->GetOption<int32>("RandomLoot.MaxItems", 1));
@@ -323,6 +341,10 @@ namespace
                 if (value >= 0.0f)
                     _chanceByLevel[level] = value;
             }
+
+            if (_debugLog >= 1)
+                LOG_INFO("module.RandomLoot", "mod-lootrandomizer config loaded: DebugLog={}, Announce={}",
+                    _debugLog.load(), _announce.load());
         }
 
         void RebuildItemPool()
@@ -465,24 +487,92 @@ namespace
             if (!candidateItemIds.empty())
             {
                 float chance = GetChanceForLevel(killed->GetLevel());
-                if (chance > 0.0f && roll_chance_f(chance))
+                if (chance > 0.0f)
                 {
-                    uint32 minItems = static_cast<uint32>(_minItems);
-                    uint32 maxItems = static_cast<uint32>(_maxItems);
+                    ++_stats[static_cast<size_t>(LootCategory::Normal)].rolls;
+                    bool hit = roll_chance_f(chance);
+                    if (_debugLog >= 2)
+                        LOG_INFO("module.RandomLoot",
+                            "mod-lootrandomizer roll: creature={} level={} playerLevel={} category={} "
+                            "chance={} result={}",
+                            killed->GetEntry(), killed->GetLevel(), playerLevel,
+                            LootCategoryName(LootCategory::Normal), chance, hit ? "hit" : "miss");
 
-                    if (maxItems < minItems)
-                        std::swap(maxItems, minItems);
+                    if (hit)
+                    {
+                        ++_stats[static_cast<size_t>(LootCategory::Normal)].hits;
 
-                    uint32 countToAdd = (minItems == maxItems) ? minItems : urand(minItems, maxItems);
-                    addedAnyRandomLoot = AddRandomLootItems(killed, candidateItemIds, countToAdd);
+                        uint32 minItems = static_cast<uint32>(_minItems);
+                        uint32 maxItems = static_cast<uint32>(_maxItems);
+
+                        if (maxItems < minItems)
+                            std::swap(maxItems, minItems);
+
+                        uint32 countToAdd = (minItems == maxItems) ? minItems : urand(minItems, maxItems);
+                        addedAnyRandomLoot = AddRandomLootItems(
+                            killed, candidateItemIds, countToAdd, LootCategory::Normal, killer, chance);
+
+                        if (_debugLog >= 1)
+                            LOG_INFO("module.RandomLoot",
+                                "mod-lootrandomizer drop: creature={} level={} playerLevel={} category={} "
+                                "chance={} count={}",
+                                killed->GetEntry(), killed->GetLevel(), playerLevel,
+                                LootCategoryName(LootCategory::Normal), chance, countToAdd);
+                    }
                 }
             }
 
-            if (hasPetCandidates && roll_chance_f(_companionLoot.PetChance))
-                addedAnyRandomLoot = AddRandomLootItems(killed, _petItemIds, 1) || addedAnyRandomLoot;
+            if (hasPetCandidates)
+            {
+                float chance = _companionLoot.PetChance;
+                ++_stats[static_cast<size_t>(LootCategory::Pet)].rolls;
+                bool hit = roll_chance_f(chance);
+                if (_debugLog >= 2)
+                    LOG_INFO("module.RandomLoot",
+                        "mod-lootrandomizer roll: creature={} level={} playerLevel={} category={} chance={} result={}",
+                        killed->GetEntry(), killed->GetLevel(), playerLevel,
+                        LootCategoryName(LootCategory::Pet), chance, hit ? "hit" : "miss");
 
-            if (hasMountCandidates && roll_chance_f(_companionLoot.MountChance))
-                addedAnyRandomLoot = AddRandomLootItems(killed, _mountItemIds, 1) || addedAnyRandomLoot;
+                if (hit)
+                {
+                    ++_stats[static_cast<size_t>(LootCategory::Pet)].hits;
+                    addedAnyRandomLoot = AddRandomLootItems(
+                        killed, _petItemIds, 1, LootCategory::Pet, killer, chance) || addedAnyRandomLoot;
+
+                    if (_debugLog >= 1)
+                        LOG_INFO("module.RandomLoot",
+                            "mod-lootrandomizer drop: creature={} level={} playerLevel={} category={} "
+                            "chance={} count=1",
+                            killed->GetEntry(), killed->GetLevel(), playerLevel,
+                            LootCategoryName(LootCategory::Pet), chance);
+                }
+            }
+
+            if (hasMountCandidates)
+            {
+                float chance = _companionLoot.MountChance;
+                ++_stats[static_cast<size_t>(LootCategory::Mount)].rolls;
+                bool hit = roll_chance_f(chance);
+                if (_debugLog >= 2)
+                    LOG_INFO("module.RandomLoot",
+                        "mod-lootrandomizer roll: creature={} level={} playerLevel={} category={} chance={} result={}",
+                        killed->GetEntry(), killed->GetLevel(), playerLevel,
+                        LootCategoryName(LootCategory::Mount), chance, hit ? "hit" : "miss");
+
+                if (hit)
+                {
+                    ++_stats[static_cast<size_t>(LootCategory::Mount)].hits;
+                    addedAnyRandomLoot = AddRandomLootItems(
+                        killed, _mountItemIds, 1, LootCategory::Mount, killer, chance) || addedAnyRandomLoot;
+
+                    if (_debugLog >= 1)
+                        LOG_INFO("module.RandomLoot",
+                            "mod-lootrandomizer drop: creature={} level={} playerLevel={} category={} "
+                            "chance={} count=1",
+                            killed->GetEntry(), killed->GetLevel(), playerLevel,
+                            LootCategoryName(LootCategory::Mount), chance);
+                }
+            }
 
             // If base loot was empty, core may have already removed the lootable flag.
             // Ensure the corpse becomes lootable when random loot is added.
@@ -492,7 +582,104 @@ namespace
             }
         }
 
+        void LogStatsSummary(char const* reason)
+        {
+            std::unique_lock lock(_mutex);
+            LogStatsSummaryLocked(reason, false);
+        }
+
+        void LogStatsSummaryAndReset(char const* reason)
+        {
+            std::unique_lock lock(_mutex);
+            LogStatsSummaryLocked(reason, true);
+        }
+
+        std::string GetStatsText() const
+        {
+            std::shared_lock lock(_mutex);
+
+            uint64 totalRolls = 0;
+            for (LootStats const& stats : _stats)
+                totalRolls += stats.rolls;
+
+            if (totalRolls == 0)
+                return "mod-lootrandomizer: no random loot rolls recorded yet.";
+
+            std::ostringstream out;
+            out << "mod-lootrandomizer stats (rolls/hits/items, observed hit rate):";
+            for (size_t i = 0; i < _stats.size(); ++i)
+            {
+                LootStats const& stats = _stats[i];
+                double hitRate = stats.rolls > 0 ? (double(stats.hits) / double(stats.rolls)) * 100.0 : 0.0;
+                out << '\n' << LootCategoryName(static_cast<LootCategory>(i))
+                    << ": " << stats.rolls << '/' << stats.hits << '/' << stats.items
+                    << ", observed " << hitRate << '%';
+            }
+            return out.str();
+        }
+
     private:
+        void LogStatsSummaryLocked(char const* reason, bool reset)
+        {
+            // Caller must hold _mutex in unique mode.
+
+            uint64 totalRolls = 0;
+            for (LootStats const& stats : _stats)
+                totalRolls += stats.rolls;
+
+            if (totalRolls == 0)
+            {
+                if (reset)
+                {
+                    for (LootStats& stats : _stats)
+                        stats = {};
+                }
+                return;
+            }
+
+            float minNormalChance = 0.0f;
+            float maxNormalChance = 0.0f;
+            if (!_chanceByLevel.empty())
+            {
+                auto const& [minItr, maxItr] = std::minmax_element(_chanceByLevel.begin(), _chanceByLevel.end(),
+                    [](auto const& a, auto const& b) { return a.second < b.second; });
+                minNormalChance = minItr->second;
+                maxNormalChance = maxItr->second;
+            }
+
+            LOG_INFO("module.RandomLoot",
+                "mod-lootrandomizer stats [{}]: total rolls={}, configured normal chance={}-{}%, pet={}%, mount={}%",
+                reason, totalRolls, minNormalChance, maxNormalChance,
+                _companionLoot.PetChance, _companionLoot.MountChance);
+
+            for (size_t i = 0; i < _stats.size(); ++i)
+            {
+                LootStats const& stats = _stats[i];
+                double hitRate = stats.rolls > 0 ? (double(stats.hits) / double(stats.rolls)) * 100.0 : 0.0;
+                LOG_INFO("module.RandomLoot",
+                    "mod-lootrandomizer stats [{}]: {} rolls={} hits={} items={} hitRate={:.2f}%",
+                    reason, LootCategoryName(static_cast<LootCategory>(i)),
+                    stats.rolls, stats.hits, stats.items, hitRate);
+            }
+
+            if (reset)
+            {
+                for (LootStats& stats : _stats)
+                    stats = {};
+            }
+        }
+
+        static char const* LootCategoryName(LootCategory cat)
+        {
+            switch (cat)
+            {
+                case LootCategory::Normal: return "normal";
+                case LootCategory::Pet:    return "pet";
+                case LootCategory::Mount:  return "mount";
+                default:                   return "unknown";
+            }
+        }
+
         bool IsAccountExcluded(uint32 accountId) const
         {
             if (!_excludedAccountIds.empty() && _excludedAccountIds.count(accountId))
@@ -668,7 +855,8 @@ namespace
             }
         }
 
-        bool AddRandomLootItems(Creature* killed, std::vector<uint32> const& itemIds, uint32 requestedCount) const
+        bool AddRandomLootItems(Creature* killed, std::vector<uint32> const& itemIds, uint32 requestedCount,
+            LootCategory category, Player* killer, float chance)
         {
             if (itemIds.empty() || requestedCount == 0 || killed->loot.items.size() >= MAX_NR_LOOT_ITEMS)
                 return false;
@@ -686,10 +874,27 @@ namespace
                 uint32 randomPos = urand(i, static_cast<uint32>(indices.size() - 1));
                 std::swap(indices[i], indices[randomPos]);
 
-                LootStoreItem randomLoot(itemIds[indices[i]], 0, 100.0f, false, LOOT_MODE_DEFAULT, 0, 1, 1);
+                uint32 itemId = itemIds[indices[i]];
+                LootStoreItem randomLoot(itemId, 0, 100.0f, false, LOOT_MODE_DEFAULT, 0, 1, 1);
                 size_t firstIndex = killed->loot.items.size();
                 killed->loot.AddItem(randomLoot);
                 PopulateInjectedLootAccess(killed, firstIndex);
+
+                ++_stats[static_cast<size_t>(category)].items;
+                if (_debugLog >= 1)
+                    LOG_INFO("module.RandomLoot",
+                        "mod-lootrandomizer injected item={} category={} creature={} player={} chance={}",
+                        itemId, LootCategoryName(category), killed->GetEntry(),
+                        killer ? killer->GetName() : "<none>", chance);
+
+                if (_announce.load() && killer && killer->GetSession() && !killer->GetSession()->IsHeadless())
+                {
+                    ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemId);
+                    ChatHandler(killer->GetSession()).PSendSysMessage(
+                        "|cff4CFF00[RandomLoot]|r {} ({} roll, {}% chance)",
+                        proto && !proto->Name1.empty() ? proto->Name1 : Acore::StringFormat("item {}", itemId),
+                        LootCategoryName(category), chance);
+                }
             }
 
             return countToAdd > 0;
@@ -976,6 +1181,10 @@ namespace
         bool _hasBuiltPoolSinceConfig = false;
         bool _templatesWereEmptyOnLastBuild = true;
 
+        std::array<LootStats, 3> _stats{};
+        std::atomic<int32> _debugLog{0};
+        std::atomic<bool> _announce{false};
+
         std::map<uint8, float> _chanceByLevel;
         std::vector<uint32> _eligibleItemIds;
         std::vector<uint32> _petItemIds;
@@ -992,6 +1201,8 @@ namespace
 
         void OnAfterConfigLoad(bool reload) override
         {
+            sRandomLootState.LogStatsSummaryAndReset("config reload");
+
             sRandomLootState.LoadConfig();
 
             if (reload)
@@ -1002,6 +1213,11 @@ namespace
         {
             // Startup guarantees item templates are loaded before first kill.
             sRandomLootState.RebuildItemPool();
+        }
+
+        void OnShutdown() override
+        {
+            sRandomLootState.LogStatsSummary("shutdown");
         }
     };
 
@@ -1020,10 +1236,38 @@ namespace
             sRandomLootState.TryAddLoot(petOwner, killed);
         }
     };
+
+    class RandomLootCommandScript : public CommandScript
+    {
+    public:
+        RandomLootCommandScript() : CommandScript("RandomLootCommandScript") { }
+
+        ChatCommandTable GetCommands() const override
+        {
+            // ChatCommandBuilder stores a reference to the subcommand table, so keep it static.
+            static ChatCommandTable statsTable =
+            {
+                { "stats", HandleStatsCommand, SEC_GAMEMASTER, Console::Yes }
+            };
+
+            static ChatCommandTable commandTable =
+            {
+                { "randomloot", statsTable }
+            };
+            return commandTable;
+        }
+
+        static bool HandleStatsCommand(ChatHandler* handler)
+        {
+            handler->SendSysMessage(sRandomLootState.GetStatsText());
+            return true;
+        }
+    };
 }
 
 void AddSC_mod_lootrandomizer()
 {
     new RandomLootWorldScript();
     new RandomLootPlayerScript();
+    new RandomLootCommandScript();
 }

@@ -54,6 +54,29 @@ RandomLoot.MinItems = 1
 RandomLoot.MaxItems = 1
 
 ###################################################################################################
+# Drop telemetry and killer notification
+#
+#    RandomLoot.DebugLog
+#        Description: Integer verbosity for random-drop telemetry. 0 disables per-kill logging.
+#                     1 logs every item the randomizer actually adds: creature entry/level, source
+#                     category (normal/pet/mount), configured chance, item ID, and player.
+#                     2 also logs every roll outcome, including failures, with the chance used, so
+#                     observed hit rates can be compared with configured numbers. The exact roll
+#                     value is not captured: recording it would require a second RNG call and change
+#                     outcomes, so only the chance and outcome are logged. Live totals are shown by
+#                     `.randomloot stats` (Game Master only).
+#        Default: 0 (off)
+#
+#    RandomLoot.Announce
+#        Description: When 1, send one targeted system chat message to the killer when a random item
+#                     is added, naming the item and the roll/category that produced it. The group and
+#                     GMs are not notified globally, and headless playerbot sessions are skipped.
+#        Default: 0 (off)
+###################################################################################################
+RandomLoot.DebugLog = 0
+RandomLoot.Announce = 0
+
+###################################################################################################
 # Item filtering
 #
 # For range settings below, a value of 0 means "no limit" for that side of the range.
